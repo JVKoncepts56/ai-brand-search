@@ -2,10 +2,10 @@ import streamlit as st
 import openai
 import json
 import time
-import re  # Ensure ASCII-safe IDs
+import re  # ✅ Ensure ASCII-safe IDs
 from pinecone import Pinecone, ServerlessSpec
 
-# ✅ Replace with your actual API keys
+# ✅ Retrieve API Key Securely
 OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 PINECONE_API_KEY = st.secrets["PINECONE_API_KEY"]
 
@@ -14,6 +14,7 @@ client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 # ✅ Initialize Pinecone
 pc = Pinecone(api_key=PINECONE_API_KEY)
+
 index_name = "negosh-matchmaking"
 
 # ✅ Check if Pinecone index exists; create if not
@@ -39,59 +40,118 @@ except FileNotFoundError:
     print("❌ Error: 'processed_brand_data.json' not found. Ensure the file exists in your directory.")
     exit(1)
 
-# ✅ Function to Generate Embeddings
-def get_embedding(text):
-    """Generate an embedding using OpenAI."""
+# ✅ Function to Ensure ASCII-Safe Brand IDs
+def clean_id(text):
+    """Removes non-ASCII characters and replaces spaces with underscores."""
+    return re.sub(r'[^\x00-\x7F]+', '', text).replace(" ", "_")
+    
+# ✅ Function to Generate Embeddings and Upload to Pinecone (Only for New Brands)
+def generate_and_upload_embeddings():
+    """Ensure all brands are embedded and uploaded to Pinecone, handling errors."""
+    print("\n🔍 Checking which brands already exist in Pinecone...")
+     
+    index_stats = index.describe_index_stats()
+    existing_count = index_stats.get("total_vector_count", 0)
+    print(f"✅ Pinecone currently contains {existing_count} vectors.")
+
+    vectors = []
+    new_brands = 0
+
+    for brand in brand_data:
+        brand_id = clean_id(brand["brand_name"])  # ✅ Ensure ASCII-compatible IDs
+        
+        print(f"🆕 Embedding brand: {brand['brand_name']}...")
+        try:
+            response = client.embeddings.create(
+                input=brand["processed_text"],
+                model="text-embedding-ada-002"
+            )
+            embedding = response.data[0].embedding
+    
+            vectors.append({
+                "id": brand_id,
+                "values": embedding, 
+                "metadata": {
+                    "name": brand["brand_name"],
+                    "category": brand.get("category", "Unknown"),
+                    "description": brand.get("description", "No description available.")
+                }
+            })
+            new_brands += 1
+    
+        except Exception as e:
+            print(f"⚠️ OpenAI embedding failed for {brand['brand_name']}: {e}")
+            continue  # ✅ Skip this brand and move to the next
+    
+    if new_brands == 0:
+        print("\n✅ No new brands to embed.")
+        return
+        
+    # ✅ Upload in batches & retry failed uploads
+    BATCH_SIZE = 100
+    for i in range(0, len(vectors), BATCH_SIZE):
+        batch = vectors[i : i + BATCH_SIZE]
+        print(f"📤 Uploading batch {i // BATCH_SIZE + 1} of {len(vectors) // BATCH_SIZE + 1}...")
+                
+        for retry in range(3):  # ✅ Retry up to 3 times
+            try:
+                index.upsert(vectors=batch)
+                print(f"✅ Successfully uploaded batch {i // BATCH_SIZE + 1}")
+                break  # ✅ If successful, move to the next batch
+            except Exception as e:   
+                print(f"⚠️ Upload failed (attempt {retry + 1}): {e}")
+                time.sleep(5)  # ✅ Wait before retrying
+            
+    print(f"\n✅ {new_brands} new brand embeddings uploaded successfully!")
+        
+# ✅ Function to Search Pinecone with Explanations
+def search_pinecone(query_text, top_k=5):
+    """Search Pinecone for brands similar to the input query and include explanations."""
+    print(f"🔍 Generating embedding for query: {query_text}")
+        
     response = client.embeddings.create(
-        input=text,
+        input=query_text,
         model="text-embedding-ada-002"
     )
-    return response.data[0].embedding
+    query_embedding = response.data[0].embedding
+        
+    print(f"🔍 Query embedding generated: {query_embedding[:5]}...")  # ✅ Print first 5 values
+                
+    print("🔍 Querying Pinecone for best matches...")   
+    results = index.query(vector=query_embedding, top_k=top_k, include_metadata=True)
 
-# ✅ Function to Search Pinecone (NO FILTERS)
-def search_pinecone(query_text, top_k=5):
-    """Search Pinecone for brands similar to the input query."""
-    
-    # ✅ Generate embedding for the search query
-    print(f"🔍 Searching for: {query_text}")
-    query_embedding = get_embedding(query_text)
+    if not results['matches']:
+        return "🚨 No results found! Try adjusting your query."
 
-    # ✅ Query Pinecone without filters
-    results = index.query(
-        vector=query_embedding,
-        top_k=top_k,
-        include_metadata=True
-    )
+    # ✅ Format results with explanations
+    formatted_results = []
+    for match in results["matches"]:
+        brand_name = match["metadata"].get("name", "Unknown Brand")
+        category = match["metadata"].get("category", "No Category Info")
+        description = match["metadata"].get("description", "No Description Available")
+        score = round(match["score"], 4)
 
-    print(f"✅ Raw Results: {results}")
+        explanation = (
+            f"🔹 **{brand_name}** (Score: {score})\n"
+            f"📌 **Category:** {category}\n"
+            f"📝 **Why this matched?** {description}\n"
+            "—" * 20
+        )
 
-    # ✅ Extract and format matches
-    matches = [
-        {"name": match["metadata"]["name"], "score": match["score"]}
-        for match in results["matches"]
-    ]
-    
-    return matches
+        formatted_results.append(explanation)
+
+    return "\n\n".join(formatted_results)
 
 # ✅ Streamlit UI
-st.title("🔎 AI Brand Search")
-st.subheader("Enter your query below to find the best brand matches.")
+st.title("🔍 AI Brand Search")
 
-# ✅ User input for query
-query_text = st.text_input("Enter your brand search query:")
+query_text = st.text_input("Enter your search query:")
 
-# ✅ Search button
 if st.button("Search"):
-    if query_text.strip():
+    if query_text:
+        st.write(f"**Searching for:** {query_text}")
         results = search_pinecone(query_text)
-
-        # ✅ Display results
-        if results:
-            st.subheader("📌 Top Matches:")
-            for match in results:
-                st.write(f"🔹 {match['name']} (Score: {match['score']:.4f})")
-        else:
-            st.warning("🚨 No results found! Try a different query.")
+        st.markdown(results)
     else:
-        st.warning("❌ Please enter a query before searching.")
+        st.warning("⚠️ Please enter a search query.")
 
